@@ -2,17 +2,16 @@ package workerpool
 
 import (
 	"context"
+
 	"github.com/VanceMichael/go-base-airbridge/internal/domain"
-	"sync"
 )
 
 type Job func(context.Context) error
+
 type Pool struct {
 	workers int
 	jobs    chan Job
-	done    chan struct{}
-	wg      sync.WaitGroup
-	once    sync.Once
+	life    *poolLifecycle
 }
 
 func New(workers, queue int) *Pool {
@@ -22,22 +21,31 @@ func New(workers, queue int) *Pool {
 	if queue < workers {
 		queue = workers
 	}
-	return &Pool{workers: workers, jobs: make(chan Job, queue), done: make(chan struct{})}
+	return &Pool{
+		workers: workers,
+		jobs:    make(chan Job, queue),
+		life:    newPoolLifecycle(),
+	}
 }
+
 func (p *Pool) Start(ctx context.Context) {
+	workerContext, ok := p.life.start(ctx)
+	if !ok {
+		return
+	}
 	for i := 0; i < p.workers; i++ {
-		p.wg.Add(1)
+		p.life.addWorker()
 		go func() {
-			defer p.wg.Done()
+			defer p.life.workerDone()
 			for {
 				select {
-				case <-ctx.Done():
+				case <-workerContext.Done():
 					return
-				case <-p.done:
+				case <-p.life.done():
 					return
 				case job := <-p.jobs:
 					if job != nil {
-						_ = job(ctx)
+						_ = job(workerContext)
 					}
 				}
 			}
@@ -48,13 +56,19 @@ func (p *Pool) Submit(ctx context.Context, job Job) error {
 	if job == nil {
 		return domain.ErrInvalid
 	}
+	if !p.life.accepting() {
+		return domain.ErrState
+	}
 	select {
 	case p.jobs <- job:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-p.done:
+	case <-p.life.done():
 		return domain.ErrState
 	}
 }
-func (p *Pool) Stop() { p.once.Do(func() { close(p.done); p.wg.Wait() }) }
+
+func (p *Pool) Stop() {
+	p.life.stop()
+}
